@@ -1,0 +1,25 @@
+[package]
+name = "rawviewer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rawviewer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", features = ["default"] }
+egui = "0.31"
+memmap2 = "0.9"
+rayon = "1.10"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+bytemuck = "1.18"
+sysinfo = "0.35"
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 1  # faster debug builds, still debuggable
