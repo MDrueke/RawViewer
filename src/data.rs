@@ -1,29 +1,31 @@
 use anyhow::{Context, Result, bail};
 use std::path::Path;
+use std::collections::HashMap;
 
-/// Probe geometry for one channel
 #[derive(Clone, Debug)]
 pub struct ChannelGeom {
     pub x_um: f32,
     pub y_um: f32,
+    pub shank: u32,
 }
 
-/// Everything parsed from the .meta file that we need
+/// One row in the display (after depth-averaging).
+/// `data_idx` is the row index into the PreprocBuffer data array (None for gaps).
+#[derive(Clone, Debug)]
+pub enum DisplayRow {
+    Data { data_idx: usize, channels: Vec<usize>, first_ch: usize, x_um: f32, y_um: f32 },
+    Gap,
+}
+
 #[derive(Clone, Debug)]
 pub struct Meta {
-    /// Total channels saved in the .bin file (includes sync)
     pub n_saved_chans: usize,
-    /// Number of AP channels (n_saved_chans - n_sync)
     pub n_ap_chans: usize,
-    /// Number of sync channels
     pub n_sync_chans: usize,
-    /// Sample rate in Hz
     pub sample_rate: f64,
-    /// Total number of samples in the file
     pub n_samples: usize,
-    /// Scale factor: int16 raw → µV
     pub uv_per_bit: f32,
-    /// Per-channel probe geometry (384 entries for NP1)
+    pub im_dat_prb_type: u32,
     pub channel_geom: Vec<ChannelGeom>,
 }
 
@@ -37,11 +39,12 @@ impl Meta {
         let mut file_size_bytes: Option<u64> = None;
         let mut ai_range_max: f64 = 0.6;
         let mut ap_gain: f64 = 500.0;
-        let mut max_int: f64 = 512.0; // NP1 default; NP2 uses 8192
+        let mut max_int: f64 = 512.0;
         let mut n_ap: Option<usize> = None;
         let mut n_lf: Option<usize> = None;
         let mut n_sy: Option<usize> = None;
         let mut geom_str: Option<String> = None;
+        let mut im_dat_prb_type: Option<u32> = None;
 
         for line in text.lines() {
             let line = line.trim_end_matches('\r');
@@ -54,7 +57,6 @@ impl Meta {
                     "imChan0apGain" => ap_gain = val.parse().unwrap_or(500.0),
                     "imMaxInt" => max_int = val.parse().unwrap_or(512.0),
                     "snsApLfSy" => {
-                        // e.g. "384,384,1"
                         let parts: Vec<&str> = val.split(',').collect();
                         if parts.len() >= 3 {
                             n_ap = parts[0].parse().ok();
@@ -62,7 +64,11 @@ impl Meta {
                             n_sy = parts[2].parse().ok();
                         }
                     }
-                    "snsGeomMap" => geom_str = Some(val.to_string()),
+                    "imDatPrb_type" => im_dat_prb_type = val.parse().ok(),
+                    // both ~snsGeomMap (new) and snsGeomMap (no tilde) variants
+                    k if k == "~snsGeomMap" || k == "snsGeomMap" => {
+                        geom_str = Some(val.to_string());
+                    }
                     _ => {}
                 }
             }
@@ -74,17 +80,12 @@ impl Meta {
 
         let n_ap = n_ap.unwrap_or(n_saved_chans.saturating_sub(1));
         let n_sy = n_sy.unwrap_or(1);
-        let _ = n_lf; // not used for AP
+        let _ = n_lf;
 
         let n_ap_chans = n_ap;
         let n_sync_chans = n_sy;
-
-        // bytes per sample = n_saved_chans * 2 (int16)
         let n_samples = (file_size_bytes / (n_saved_chans as u64 * 2)) as usize;
-
-        // µV per raw int16 bit
         let uv_per_bit = (ai_range_max / max_int / ap_gain * 1e6) as f32;
-
         let channel_geom = parse_geom_map(geom_str.as_deref(), n_ap_chans);
 
         Ok(Meta {
@@ -94,21 +95,111 @@ impl Meta {
             sample_rate,
             n_samples,
             uv_per_bit,
+            im_dat_prb_type: im_dat_prb_type.unwrap_or(0),
             channel_geom,
         })
     }
+
+    /// Compute the typical vertical pitch (µm) per shank from the geometry.
+    /// Returns the minimum positive y-difference between channels on the same shank.
+    fn typical_pitch_per_shank(&self) -> HashMap<u32, f32> {
+        let mut by_shank: HashMap<u32, Vec<f32>> = HashMap::new();
+        for g in &self.channel_geom {
+            by_shank.entry(g.shank).or_default().push(g.y_um);
+        }
+        let mut result = HashMap::new();
+        for (shank, mut ys) in by_shank {
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys.dedup_by(|a, b| (*a - *b).abs() < 0.1);
+            let min_diff = ys.windows(2)
+                .filter_map(|w| {
+                    let d = w[1] - w[0];
+                    if d > 0.1 { Some(d) } else { None }
+                })
+                .fold(f32::INFINITY, f32::min);
+            result.insert(shank, if min_diff.is_finite() { min_diff } else { 20.0 });
+        }
+        result
+    }
+
+    /// Build the ordered list of display rows for rendering.
+    ///
+    /// If `avg_depths` is true, channels at the same (shank, y_um) are averaged into one row.
+    /// Gap rows are inserted wherever the vertical distance between consecutive rows
+    /// exceeds 1.5× the typical pitch for that shank.
+    pub fn build_display_rows(&self, avg_depths: bool) -> Vec<DisplayRow> {
+        let pitch_map = self.typical_pitch_per_shank();
+
+        // collect (shank, y_um, channel_idx) tuples
+        let mut entries: Vec<(u32, f32, usize)> = self.channel_geom.iter()
+            .enumerate()
+            .map(|(i, g)| (g.shank, g.y_um, i))
+            .collect();
+        // sort by shank, then y ascending
+        entries.sort_by(|a, b| {
+            a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // group by (shank, y_um)
+        let mut groups: Vec<(u32, f32, Vec<usize>)> = Vec::new();
+        for (shank, y, ch) in entries {
+            if let Some(last) = groups.last_mut() {
+                if last.0 == shank && (last.1 - y).abs() < 0.5 && avg_depths {
+                    last.2.push(ch);
+                    continue;
+                }
+            }
+            groups.push((shank, y, vec![ch]));
+        }
+
+        // if not avg_depths, each channel is its own group (already the case above since we skip merging)
+        // Re-sort group channels so first_ch is the smallest index
+        for (_, _, chs) in &mut groups {
+            chs.sort_unstable();
+        }
+
+        // build display rows with gap detection
+        let mut rows: Vec<DisplayRow> = Vec::new();
+        let mut data_idx = 0usize;
+        let mut prev: Option<(u32, f32)> = None; // (shank, y)
+
+        for (shank, y, channels) in &groups {
+            let pitch = *pitch_map.get(shank).unwrap_or(&20.0);
+
+            if let Some((prev_shank, prev_y)) = prev {
+                let gap = if *shank != prev_shank {
+                    // different shank: always insert a gap
+                    true
+                } else {
+                    // same shank: gap if spacing > 1.5× pitch
+                    (y - prev_y) > pitch * 1.5
+                };
+                if gap {
+                    rows.push(DisplayRow::Gap);
+                }
+            }
+
+            let first_ch = *channels.first().unwrap();
+            let x_um = self.channel_geom[first_ch].x_um;
+            rows.push(DisplayRow::Data {
+                data_idx,
+                channels: channels.clone(),
+                first_ch,
+                x_um,
+                y_um: *y,
+            });
+            data_idx += 1;
+            prev = Some((*shank, *y));
+        }
+
+        rows
+    }
 }
 
-/// Parse snsGeomMap into per-channel (x, y) in µm.
-/// Format: (header)(ch:x:y:used)...
 fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
     let default = || {
-        // fallback: linear layout at x=0, y = ch * 20 µm
         (0..n_ap)
-            .map(|i| ChannelGeom {
-                x_um: 0.0,
-                y_um: i as f32 * 20.0,
-            })
+            .map(|i| ChannelGeom { x_um: 0.0, y_um: i as f32 * 20.0, shank: 0 })
             .collect()
     };
 
@@ -117,9 +208,8 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
         None => return default(),
     };
 
-    // entries are parenthesised: (shank:x:y:used)
+    // entries are parenthesised: (shank:x_um:y_um:used)
     let mut geoms: Vec<(usize, ChannelGeom)> = Vec::new();
-    let mut idx: usize = 0;
     let mut ch_idx: usize = 0;
     for token in s.split(')') {
         let token = token.trim_start_matches('(');
@@ -128,23 +218,21 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
         }
         let parts: Vec<&str> = token.split(':').collect();
         if parts.len() == 4 {
-            // shank:x:y:used  — channel index matches order of appearance
+            // shank:x:y:used
+            let shank: u32 = parts[0].parse().unwrap_or(0);
             let x: f32 = parts[1].parse().unwrap_or(0.0);
             let y: f32 = parts[2].parse().unwrap_or(0.0);
-            geoms.push((ch_idx, ChannelGeom { x_um: x, y_um: y }));
+            geoms.push((ch_idx, ChannelGeom { x_um: x, y_um: y, shank }));
             ch_idx += 1;
-            idx += 1;
-        } else {
-            // the first token is the header "(probe_type,n_col,n_row,...)"
-            // skip it; it contains colons but different format
         }
+        // else: header token like "(NP1000,1,0,70)" — skip
     }
 
     if geoms.is_empty() {
         return default();
     }
 
-    let mut out = vec![ChannelGeom { x_um: 0.0, y_um: 0.0 }; n_ap];
+    let mut out = vec![ChannelGeom { x_um: 0.0, y_um: 0.0, shank: 0 }; n_ap];
     for (i, g) in geoms.into_iter().take(n_ap) {
         out[i] = g;
     }
@@ -155,16 +243,13 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
 // Raw data access
 // ---------------------------------------------------------------------------
 
-/// Flat buffer of i16 samples, shape: [n_samples × n_saved_chans]
 pub enum RawData {
     Loaded(Vec<i16>),
     Mmap(memmap2::Mmap),
 }
 
 impl RawData {
-    /// Return a slice of int16 samples for the given sample range and the AP channels only.
-    /// Output shape: n_ap × n_samp, stored as a flat Vec<f32> in µV.
-    /// Channels are ordered 0..n_ap (sync channel excluded).
+    /// Return a flat Vec<f32> in µV, layout: [n_ap][n_samp].
     pub fn read_chunk_uv(
         &self,
         first_sample: usize,
@@ -174,8 +259,6 @@ impl RawData {
         let n_ch = meta.n_saved_chans;
         let n_ap = meta.n_ap_chans;
         let scale = meta.uv_per_bit;
-
-        // clamp to available samples
         let n_samp = n_samp.min(meta.n_samples.saturating_sub(first_sample));
 
         let raw = self.as_i16_slice();
@@ -183,9 +266,7 @@ impl RawData {
         let end = (first_sample + n_samp) * n_ch;
         let src = &raw[start..end.min(raw.len())];
 
-        // output: [n_ap][n_samp], row-major
         let mut out = vec![0.0f32; n_ap * n_samp];
-        // rayon parallel over channels
         use rayon::prelude::*;
         out.par_chunks_mut(n_samp)
             .enumerate()
@@ -208,68 +289,21 @@ impl RawData {
             RawData::Mmap(m) => bytemuck::cast_slice(m.as_ref()),
         }
     }
-
-    pub fn n_i16_samples(&self) -> usize {
-        self.as_i16_slice().len()
-    }
 }
 
-/// Open the raw data file via memory-mapped I/O.
-/// The OS page-cache handles read-ahead and eviction — no OOM risk.
 pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<(RawData, usize)> {
     let file = std::fs::File::open(bin_path)
         .with_context(|| format!("opening {}", bin_path.display()))?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    // verify alignment
+    if mmap.as_ptr() as usize % 2 != 0 {
+        bail!("mmap pointer is not 2-byte aligned");
+    }
     Ok((RawData::Mmap(mmap), meta.n_samples))
-}
-
-/// Load an additional chunk starting at `from_sample` up to `max_bytes`.
-/// Extends an existing Loaded buffer.
-pub fn extend_data(
-    bin_path: &Path,
-    meta: &Meta,
-    existing: &mut RawData,
-    already_loaded_samples: usize,
-    headroom_bytes: u64,
-) -> Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let file_size = std::fs::metadata(bin_path)?.len();
-    let bytes_per_sample = (meta.n_saved_chans * 2) as u64;
-    let remaining_samples = meta.n_samples.saturating_sub(already_loaded_samples);
-    if remaining_samples == 0 {
-        return Ok(already_loaded_samples);
-    }
-
-    let available = free_ram_bytes().saturating_sub(headroom_bytes);
-    let n_new = ((available / bytes_per_sample) as usize).min(remaining_samples);
-    if n_new == 0 {
-        bail!("Not enough RAM to load more data");
-    }
-
-    let byte_offset = already_loaded_samples as u64 * bytes_per_sample;
-    let load_bytes = (n_new as u64 * bytes_per_sample).min(file_size - byte_offset);
-
-    let mut file = std::fs::File::open(bin_path)?;
-    file.seek(SeekFrom::Start(byte_offset))?;
-    let mut buf = vec![0u8; load_bytes as usize];
-    file.read_exact(&mut buf)?;
-    let new_i16: Vec<i16> = bytemuck::cast_vec(buf);
-
-    match existing {
-        RawData::Loaded(v) => v.extend_from_slice(&new_i16),
-        RawData::Mmap(_) => {
-            // should not be called on mmap, but handle gracefully
-            *existing = RawData::Loaded(new_i16);
-        }
-    }
-
-    Ok(already_loaded_samples + n_new)
 }
 
 /// Query free physical RAM in bytes via /proc/meminfo
 pub fn free_ram_bytes() -> u64 {
-    // MemAvailable is the best estimate of usable free RAM
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         for line in text.lines() {
             if line.starts_with("MemAvailable:") {
@@ -282,5 +316,5 @@ pub fn free_ram_bytes() -> u64 {
             }
         }
     }
-    4 * 1024 * 1024 * 1024 // fallback: 4 GB
+    4 * 1024 * 1024 * 1024
 }
