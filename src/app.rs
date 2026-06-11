@@ -76,10 +76,12 @@ pub struct RawViewerApp {
 
     // UI state
     pending_cfg_recompute: bool,
+    pub file_dialog_request: bool,
+    projection_sums: Vec<f32>,
 }
 
 impl RawViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, bin_path: PathBuf) -> anyhow::Result<Self> {
+    pub fn new(ctx: &egui::Context, bin_path: PathBuf) -> anyhow::Result<Self> {
         let meta_path = bin_path.with_extension("meta");
         let meta = Arc::new(Meta::from_file(&meta_path)?);
         let (raw, _) = open_data(&bin_path, &meta)?;
@@ -112,7 +114,7 @@ impl RawViewerApp {
             Arc::clone(&filters),
             Arc::clone(&shared),
             Arc::clone(&cancel),
-            cc.egui_ctx.clone(),
+            ctx.clone(),
         );
 
         // send initial request
@@ -159,6 +161,8 @@ impl RawViewerApp {
             waiting_since: None,
             last_requested_center: 0,
             pending_cfg_recompute: false,
+            file_dialog_request: false,
+            projection_sums: Vec::new(),
         })
     }
 
@@ -206,6 +210,13 @@ impl RawViewerApp {
 
     fn draw_toolbar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            ui.menu_button("File", |ui| {
+                if ui.button("Open").clicked() {
+                    self.file_dialog_request = true;
+                    ui.close_menu();
+                }
+            });
+            ui.separator();
             ui.label(format!(
                 "{}",
                 self.bin_path.file_name().unwrap_or_default().to_string_lossy()
@@ -506,8 +517,8 @@ impl RawViewerApp {
     }
 }
 
-impl eframe::App for RawViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl RawViewerApp {
+    pub fn update(&mut self, ctx: &egui::Context) {
         // request repaint while worker is busy
         {
             let (lock, _) = &*self.worker_state;
@@ -615,6 +626,42 @@ impl eframe::App for RawViewerApp {
                             };
 
                             let (first_row, last_row) = self.visible_row_range(display_rows);
+                            
+                            // Compute projection sums (spike counts)
+                            let visible = &display_rows[first_row..=last_row];
+                            let mut sums = vec![0.0f32; visible.len()];
+                            
+                            let sample_rate = self.meta.sample_rate;
+                            let refractory_samples = (1.5 * sample_rate as f32 / 1000.0) as usize;
+                            let threshold = -30.0f32;
+
+                            use rayon::prelude::*;
+                            sums.par_iter_mut().enumerate().for_each(|(i, count)| {
+                                if let DisplayRow::Data { data_idx, .. } = &visible[i] {
+                                    let base = data_idx * stride + offset;
+                                    if base + n <= data_arc.len() {
+                                        let ch_data = &data_arc[base..base + n];
+                                        let mut spikes = 0.0f32;
+                                        let mut last_spike = None;
+                                        for (t, &v) in ch_data.iter().enumerate() {
+                                            if v < threshold {
+                                                if let Some(last_t) = last_spike {
+                                                    if t - last_t > refractory_samples {
+                                                        spikes += 1.0;
+                                                        last_spike = Some(t);
+                                                    }
+                                                } else {
+                                                    spikes += 1.0;
+                                                    last_spike = Some(t);
+                                                }
+                                            }
+                                        }
+                                        *count = spikes;
+                                    }
+                                }
+                            });
+                            self.projection_sums = sums;
+
                             build_heatmap_into(
                                 &mut self.pixel_buf,
                                 &data_arc,
@@ -797,6 +844,40 @@ impl eframe::App for RawViewerApp {
                         }
                         if let Some(ch2) = self.selected_channel_2 {
                             draw_line(ch2, egui::Color32::from_rgba_unmultiplied(255, 182, 23, 128));
+                        }
+
+                        // Draw Projection Overlay
+                        if !self.projection_sums.is_empty() {
+                            // User setting: Adjust this scaling factor to change how far to the right the spike counts project.
+                            let spike_scale_factor = 1.0; 
+                            
+                            // 10% opacity white for all colormaps
+                            let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
+
+                            let min_x = resp.rect.left();
+                            let max_x = resp.rect.right(); // Can project across the entire image if scaled high enough
+                            let top_y = resp.rect.top();
+                            let h = resp.rect.height();
+
+                            let row_h = h / n_rows as f32;
+
+                            for (i, &count) in self.projection_sums.iter().enumerate() {
+                                if count <= 0.0 { continue; }
+                                let x = min_x + count * spike_scale_factor;
+                                let x = x.min(max_x); // clamp to the right edge of the image
+                                
+                                let y_bottom = top_y + h - (i as f32) * row_h;
+                                let y_top = top_y + h - ((i + 1) as f32) * row_h;
+
+                                ui.painter().rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(min_x, y_top),
+                                        egui::pos2(x, y_bottom),
+                                    ),
+                                    0.0,
+                                    color,
+                                );
+                            }
                         }
                     }
 

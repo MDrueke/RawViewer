@@ -16,22 +16,83 @@ struct Args {
     file: Option<PathBuf>,
 }
 
+enum AppState {
+    Empty,
+    Loaded(app::RawViewerApp),
+}
+
+struct MainApp {
+    state: AppState,
+}
+
+impl MainApp {
+    fn new(ctx: &egui::Context, bin_path: Option<PathBuf>) -> Self {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        visuals.window_fill = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        ctx.set_visuals(visuals);
+        let state = if let Some(path) = bin_path {
+            match app::RawViewerApp::new(ctx, path) {
+                Ok(a) => AppState::Loaded(a),
+                Err(e) => {
+                    eprintln!("Error opening file: {e}");
+                    AppState::Empty
+                }
+            }
+        } else {
+            AppState::Empty
+        };
+        Self { state }
+    }
+}
+
+impl eframe::App for MainApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut file_to_open = None;
+
+        match &mut self.state {
+            AppState::Empty => {
+                egui::TopBottomPanel::top("empty_top_bar").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.menu_button("File", |ui| {
+                            if ui.button("Open").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().add_filter("Bin files", &["bin"]).pick_file() {
+                                    file_to_open = Some(path);
+                                }
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                });
+
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("open a file to start");
+                    });
+                });
+            }
+            AppState::Loaded(app) => {
+                app.update(ctx);
+                if app.file_dialog_request {
+                    app.file_dialog_request = false;
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Bin files", &["bin"]).pick_file() {
+                        file_to_open = Some(path);
+                    }
+                }
+            }
+        }
+
+        if let Some(path) = file_to_open {
+            match app::RawViewerApp::new(ctx, path) {
+                Ok(a) => self.state = AppState::Loaded(a),
+                Err(e) => eprintln!("Error opening file: {e}"),
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
-    // if no file given, open a native file dialog
-    let bin_path = match args.file {
-        Some(p) => p,
-        None => {
-            // simple fallback: ask via stdin
-            eprintln!("No file specified with --file. Usage: rawviewer --file <path.ap.bin>");
-            std::process::exit(1);
-        }
-    };
-
-    if !bin_path.exists() {
-        anyhow::bail!("File not found: {}", bin_path.display());
-    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -45,15 +106,7 @@ fn main() -> anyhow::Result<()> {
         "RawViewer",
         options,
         Box::new(move |cc| {
-            // set dark theme
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
-            match app::RawViewerApp::new(cc, bin_path) {
-                Ok(a) => Ok(Box::new(a) as Box<dyn eframe::App>),
-                Err(e) => {
-                    eprintln!("Error opening file: {e}");
-                    std::process::exit(1);
-                }
-            }
+            Ok(Box::new(MainApp::new(&cc.egui_ctx, args.file)))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {e}"))?;

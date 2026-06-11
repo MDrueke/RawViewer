@@ -256,9 +256,9 @@ impl RawData {
         let n_samp = n_samp.min(meta.n_samples.saturating_sub(first_sample));
 
         let raw = self.as_i16_slice();
-        let start = first_sample * n_ch;
-        let end = (first_sample + n_samp) * n_ch;
-        let src = &raw[start..end.min(raw.len())];
+        let start = (first_sample * n_ch).min(raw.len());
+        let end = ((first_sample + n_samp) * n_ch).min(raw.len());
+        let src = &raw[start..end];
 
         let mut out = vec![0.0f32; n_ap * n_samp];
         use rayon::prelude::*;
