@@ -4,6 +4,7 @@ mod geometry;
 mod preprocess;
 mod render;
 mod worker;
+mod mtscomp;
 
 use clap::Parser;
 use std::path::PathBuf;
@@ -28,8 +29,12 @@ struct MainApp {
 impl MainApp {
     fn new(ctx: &egui::Context, bin_path: Option<PathBuf>) -> Self {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(0x18, 0x18, 0x18);
-        visuals.window_fill = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        let bg_color = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        visuals.panel_fill = bg_color;
+        visuals.window_fill = bg_color;
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x28, 0x28, 0x28); // slightly lighter for hover
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0x38, 0x38, 0x38);  // slightly lighter for active
+        visuals.extreme_bg_color = visuals.widgets.inactive.bg_fill; // make text edits match sliders
         ctx.set_visuals(visuals);
         let state = if let Some(path) = bin_path {
             match app::RawViewerApp::new(ctx, path) {
@@ -56,7 +61,11 @@ impl eframe::App for MainApp {
                     ui.horizontal(|ui| {
                         ui.menu_button("File", |ui| {
                             if ui.button("Open").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().add_filter("Bin files", &["bin"]).pick_file() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Recordings", &["bin", "cbin"])
+                                    .add_filter("Uncompressed", &["bin"])
+                                    .add_filter("Compressed", &["cbin"])
+                                    .pick_file() {
                                     file_to_open = Some(path);
                                 }
                                 ui.close_menu();
@@ -75,7 +84,11 @@ impl eframe::App for MainApp {
                 app.update(ctx);
                 if app.file_dialog_request {
                     app.file_dialog_request = false;
-                    if let Some(path) = rfd::FileDialog::new().add_filter("Bin files", &["bin"]).pick_file() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Recordings", &["bin", "cbin"])
+                        .add_filter("Uncompressed", &["bin"])
+                        .add_filter("Compressed", &["cbin"])
+                        .pick_file() {
                         file_to_open = Some(path);
                     }
                 }
@@ -87,6 +100,12 @@ impl eframe::App for MainApp {
                 Ok(a) => self.state = AppState::Loaded(a),
                 Err(e) => eprintln!("Error opening file: {e}"),
             }
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let AppState::Loaded(app) = &self.state {
+            app.save_prefs();
         }
     }
 }

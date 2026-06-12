@@ -240,7 +240,10 @@ fn parse_geom_map(s: Option<&str>, n_ap: usize) -> Vec<ChannelGeom> {
 // Raw data access
 // ---------------------------------------------------------------------------
 
-pub struct RawData(pub memmap2::Mmap);
+pub enum RawData {
+    Uncompressed(memmap2::Mmap),
+    Compressed(crate::mtscomp::MtscompReader),
+}
 
 impl RawData {
     /// Return a flat Vec<f32> in µV, layout: [n_ap][n_samp].
@@ -255,40 +258,99 @@ impl RawData {
         let scale = meta.uv_per_bit;
         let n_samp = n_samp.min(meta.n_samples.saturating_sub(first_sample));
 
-        let raw = self.as_i16_slice();
-        let start = (first_sample * n_ch).min(raw.len());
-        let end = ((first_sample + n_samp) * n_ch).min(raw.len());
-        let src = &raw[start..end];
+        match self {
+            RawData::Uncompressed(mmap) => {
+                let raw: &[i16] = bytemuck::cast_slice(mmap.as_ref());
+                let start = (first_sample * n_ch).min(raw.len());
+                let end = ((first_sample + n_samp) * n_ch).min(raw.len());
+                let src = &raw[start..end];
 
-        let mut out = vec![0.0f32; n_ap * n_samp];
-        use rayon::prelude::*;
-        out.par_chunks_mut(n_samp)
-            .enumerate()
-            .for_each(|(ch, row)| {
-                for t in 0..n_samp {
-                    let idx = t * n_ch + ch;
-                    row[t] = if idx < src.len() {
-                        src[idx] as f32 * scale
-                    } else {
-                        0.0
-                    };
+                let mut out = vec![0.0f32; n_ap * n_samp];
+                use rayon::prelude::*;
+                out.par_chunks_mut(n_samp)
+                    .enumerate()
+                    .for_each(|(ch, row)| {
+                        for t in 0..n_samp {
+                            let idx = t * n_ch + ch;
+                            row[t] = if idx < src.len() {
+                                src[idx] as f32 * scale
+                            } else {
+                                0.0
+                            };
+                        }
+                    });
+                out
+            }
+            RawData::Compressed(reader) => {
+                // Find overlapping chunks
+                let mut out = vec![0.0f32; n_ap * n_samp];
+                let end_sample = first_sample + n_samp;
+                
+                // Identify which chunks we need
+                let chunk_bounds = &reader.meta.chunk_bounds;
+                let mut start_idx = 0;
+                while start_idx < chunk_bounds.len() - 1 && chunk_bounds[start_idx + 1] <= first_sample {
+                    start_idx += 1;
                 }
-            });
-        out
-    }
+                
+                let mut current_idx = start_idx;
+                let mut out_offset = 0;
 
-    fn as_i16_slice(&self) -> &[i16] {
-        bytemuck::cast_slice(self.0.as_ref())
+                while current_idx < chunk_bounds.len() - 1 && out_offset < n_samp {
+                    let chunk_start = chunk_bounds[current_idx];
+                    let chunk_end = chunk_bounds[current_idx + 1];
+                    let chunk_len = chunk_end - chunk_start;
+
+                    // Compute overlap
+                    let overlap_start = chunk_start.max(first_sample);
+                    let overlap_end = chunk_end.min(end_sample);
+                    
+                    if overlap_start < overlap_end {
+                        let overlap_len = overlap_end - overlap_start;
+                        let src_offset = overlap_start - chunk_start;
+
+                        if let Ok(decompressed) = reader.decompress_chunk(current_idx) {
+                            // Decompressed is in C-order: [time * n_channels + ch]
+                            use rayon::prelude::*;
+                            let out_ptr = out.as_mut_ptr() as usize; // safe to pass pointer across threads inside par_chunks_mut? No, we will partition instead.
+                            // Better: process channel by channel
+                            out.par_chunks_mut(n_samp).enumerate().for_each(|(ch, row_dst)| {
+                                for t in 0..overlap_len {
+                                    let src_idx = (src_offset + t) * n_ch + ch;
+                                    if src_idx < decompressed.len() {
+                                        row_dst[out_offset + t] = decompressed[src_idx] as f32 * scale;
+                                    }
+                                }
+                            });
+                        }
+                        out_offset += overlap_len;
+                    }
+                    current_idx += 1;
+                }
+
+                out
+            }
+        }
     }
 }
 
 pub fn open_data(bin_path: &Path, meta: &Meta) -> Result<(RawData, usize)> {
-    let file = std::fs::File::open(bin_path)
-        .with_context(|| format!("opening {}", bin_path.display()))?;
-    let mmap = unsafe { memmap2::Mmap::map(&file)? };
-    // verify alignment
-    if mmap.as_ptr() as usize % 2 != 0 {
-        bail!("mmap pointer is not 2-byte aligned");
+    if bin_path.extension().and_then(|s| s.to_str()) == Some("cbin") {
+        let ch_path = bin_path.with_extension("ch");
+        if !ch_path.exists() {
+            bail!("Metadata file {} not found for {}", ch_path.display(), bin_path.display());
+        }
+        let mts_meta = crate::mtscomp::MtscompMeta::from_file(&ch_path)?;
+        let reader = crate::mtscomp::MtscompReader::new(bin_path, mts_meta)?;
+        Ok((RawData::Compressed(reader), meta.n_samples))
+    } else {
+        let file = std::fs::File::open(bin_path)
+            .with_context(|| format!("opening {}", bin_path.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // verify alignment
+        if mmap.as_ptr() as usize % 2 != 0 {
+            bail!("mmap pointer is not 2-byte aligned");
+        }
+        Ok((RawData::Uncompressed(mmap), meta.n_samples))
     }
-    Ok((RawData(mmap), meta.n_samples))
 }

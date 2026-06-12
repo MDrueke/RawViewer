@@ -1,9 +1,0 @@
-Regarding your questions:
-1. Depth averaging should happen before all the preprocessing
-2. Keep the channel numbers. We don't know the depth inside the brain yet, as this is merely displaying the raw data. Just use the first channel's number of the two averaged channels per row. Same for the widget that shows the channel index when hovering over the data.
-3. Only show this when the currently requested slice can't be displayed because the chunk that has this data on is still loading or being preprocessed
-4. Let's replace the uV slider with the percentile. So that the slider controls the percentile.
-
-By the way, maybe I didn't make this clear - we can't always expect the channels to be in a continuous block. So only average across two channels if they are on the same shank and they are at the same depth.
-
-One more thing: If there are gaps in the shank map, display a light grey line at that point, so that the user knows that the data is not continous in vertical direction. So if the verical spacing between a set of channels is more than the normal vertical spacing of that probe type, insert a virtual channel at that point in the image that just is filled with light grey

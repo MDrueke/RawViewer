@@ -106,9 +106,10 @@ fn compute_pct_table(data: &[f32]) -> PctTable {
 // Compute the dynamic half-window size based on available RAM
 // ---------------------------------------------------------------------------
 
-pub fn compute_half_window(_n_data_rows: usize, sample_rate: f64) -> usize {
-    // 5-second total processing window = 2.5s half window
-    (2.5 * sample_rate) as usize
+pub fn compute_half_window(view_dur_s: f64, sample_rate: f64) -> usize {
+    // We want the total buffer to be view_dur_s plus 2.5s padding on each side.
+    // The half_window is computed around the center.
+    ((view_dur_s / 2.0 + 2.5) * sample_rate) as usize
 }
 
 // ---------------------------------------------------------------------------

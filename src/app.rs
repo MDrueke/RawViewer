@@ -12,13 +12,13 @@ use crate::worker::{
     compute_half_window, spawn_worker,
 };
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColorMode {
     Percentile,
     Voltage,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ColorMapChoice {
     YellowMagenta,
     RedBlue,
@@ -28,14 +28,53 @@ pub enum ColorMapChoice {
     GreyScale,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Preferences {
+    pub preproc_cfg: PreprocConfig,
+    pub view_dur_s: f64,
+    pub color_mode: ColorMode,
+    pub color_pct: f32,
+    pub color_uv: f32,
+    pub colormap_choice: ColorMapChoice,
+    pub spike_threshold: f32,
+}
+
+impl Preferences {
+    pub fn load() -> Option<Self> {
+        let path = Self::path();
+        if let Ok(s) = std::fs::read_to_string(path) {
+            toml::from_str(&s).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn save(&self) {
+        let path = Self::path();
+        if let Ok(s) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+
+    fn path() -> std::path::PathBuf {
+        if let Ok(home) = std::env::var("HOME") {
+            std::path::PathBuf::from(home).join(".rawviewer_prefs.toml")
+        } else {
+            std::path::PathBuf::from("rawviewer_prefs.toml")
+        }
+    }
+}
+
 pub struct RawViewerApp {
     bin_path: PathBuf,
     meta: Arc<Meta>,
+    is_compressed: bool,
 
     // view state
     view_start_s: f64,
     view_dur_s: f64,
     window_dur_str: String,   // owned string for the text field
+    jump_str: String,         // owned string for the jump text field
     ch_first: usize,          // first_ch of first visible data row
     ch_last: usize,           // first_ch of last visible data row
 
@@ -51,6 +90,10 @@ pub struct RawViewerApp {
     color_pct_str: String,
     color_uv_str: String,
     colormap_choice: ColorMapChoice,
+
+    // preferences
+    show_preferences: bool,
+    spike_threshold: f32,
 
     // selected channels
     selected_channel_1: Option<usize>,
@@ -88,7 +131,9 @@ impl RawViewerApp {
         let raw = Arc::new(raw);
         let fs = meta.sample_rate;
 
-        let preproc_cfg = PreprocConfig {
+        let prefs = Preferences::load();
+
+        let mut preproc_cfg = PreprocConfig {
             dc_removal: true,
             phase_shift: false,
             highpass: true,
@@ -97,6 +142,25 @@ impl RawViewerApp {
             sample_rate: fs,
             im_dat_prb_type: meta.im_dat_prb_type,
         };
+
+        let mut view_dur_s = 0.5;
+        let mut color_mode = ColorMode::Percentile;
+        let mut color_pct = 99.0;
+        let mut color_uv = 120.0;
+        let mut colormap_choice = ColorMapChoice::IceFire;
+        let mut spike_threshold = -40.0;
+
+        if let Some(p) = prefs {
+            preproc_cfg = p.preproc_cfg;
+            preproc_cfg.sample_rate = fs;
+            preproc_cfg.im_dat_prb_type = meta.im_dat_prb_type;
+            view_dur_s = p.view_dur_s;
+            color_mode = p.color_mode;
+            color_pct = p.color_pct;
+            color_uv = p.color_uv;
+            colormap_choice = p.colormap_choice;
+            spike_threshold = p.spike_threshold;
+        }
         let filters = Arc::new(Mutex::new(Filters::new(&preproc_cfg)));
         let shared: SharedWorkerState = Arc::new((Mutex::new(WorkerState::new()), Condvar::new()));
         let cancel: SharedCancel = Arc::new(AtomicBool::new(false));
@@ -106,7 +170,7 @@ impl RawViewerApp {
         let n_data_rows = display_rows.iter()
             .filter(|r| matches!(r, DisplayRow::Data { .. }))
             .count();
-        let half_window = compute_half_window(n_data_rows, fs);
+        let half_window = compute_half_window(view_dur_s, fs);
 
         let handle = spawn_worker(
             Arc::clone(&raw),
@@ -128,24 +192,30 @@ impl RawViewerApp {
             cvar.notify_one();
         }
 
+        let is_compressed = bin_path.extension().and_then(|s| s.to_str()) == Some("cbin");
+
         let n_ap = meta.n_ap_chans;
         Ok(Self {
             bin_path,
             meta,
+            is_compressed,
             view_start_s: 0.0,
-            view_dur_s: 0.5,
-            window_dur_str: "0.500".to_string(),
+            view_dur_s,
+            window_dur_str: format!("{:.3}", view_dur_s),
+            jump_str: "0.000".to_string(),
             ch_first: 0,
             ch_last: n_ap.saturating_sub(1),
             preproc_cfg: preproc_cfg.clone(),
             preproc_filters: filters,
             scroll_speed_fine: true,
-            color_mode: ColorMode::Percentile,
-            color_pct: 99.0,
-            color_uv: 120.0,
-            color_pct_str: "99.0".to_string(),
-            color_uv_str: "120.0".to_string(),
-            colormap_choice: ColorMapChoice::YellowMagenta,
+            color_mode,
+            color_pct,
+            color_uv,
+            color_pct_str: format!("{:.2}", color_pct),
+            color_uv_str: format!("{:.0}", color_uv),
+            colormap_choice,
+            show_preferences: false,
+            spike_threshold,
             selected_channel_1: None,
             selected_channel_2: None,
             worker_state: shared,
@@ -164,6 +234,19 @@ impl RawViewerApp {
             file_dialog_request: false,
             projection_sums: Vec::new(),
         })
+    }
+
+    pub fn save_prefs(&self) {
+        let prefs = Preferences {
+            preproc_cfg: self.preproc_cfg.clone(),
+            view_dur_s: self.view_dur_s,
+            color_mode: self.color_mode.clone(),
+            color_pct: self.color_pct,
+            color_uv: self.color_uv,
+            colormap_choice: self.colormap_choice.clone(),
+            spike_threshold: self.spike_threshold,
+        };
+        prefs.save();
     }
 
     fn request_recompute(&mut self) {
@@ -236,6 +319,7 @@ impl RawViewerApp {
                     let new_dur = v.clamp(0.01, 10.0);
                     if (new_dur - self.view_dur_s).abs() > 1e-6 {
                         self.view_dur_s = new_dur;
+                        self.worker_half_window = compute_half_window(self.view_dur_s, self.meta.sample_rate);
                         self.heatmap_texture = None;
                         self.pending_cfg_recompute = true;
                     }
@@ -253,29 +337,6 @@ impl RawViewerApp {
 
             // Color scale controls
             ui.label("Color:");
-            
-            let mut cm = self.colormap_choice.clone();
-            egui::ComboBox::from_id_salt("cm_combo")
-                .selected_text(match cm {
-                    ColorMapChoice::YellowMagenta => "Yellow-Magenta",
-                    ColorMapChoice::RedBlue => "Red-Blue",
-                    ColorMapChoice::OrangeBlue => "Orange-Blue",
-                    ColorMapChoice::IceFire => "Ice-Fire",
-                    ColorMapChoice::Vanimo => "Vanimo",
-                    ColorMapChoice::GreyScale => "Greyscale",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
-                    ui.selectable_value(&mut cm, ColorMapChoice::RedBlue, "Red-Blue");
-                    ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "Orange-Blue");
-                    ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "Ice-Fire");
-                    ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "Vanimo");
-                    ui.selectable_value(&mut cm, ColorMapChoice::GreyScale, "Greyscale");
-                });
-            if cm != self.colormap_choice {
-                self.colormap_choice = cm;
-                self.heatmap_texture = None; // Force redraw
-            }
 
             if ui.radio_value(&mut self.color_mode, ColorMode::Percentile, "%ile").changed()
                 || ui.radio_value(&mut self.color_mode, ColorMode::Voltage, "±µV").changed() {
@@ -301,6 +362,12 @@ impl RawViewerApp {
                     self.heatmap_texture = None;
                 }
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Preferences").clicked() {
+                    self.show_preferences = !self.show_preferences;
+                }
+            });
         });
     }
 
@@ -367,14 +434,10 @@ impl RawViewerApp {
             }
 
             // computing spinner
-            let status = {
+            let _status = {
                 let (lock, _) = &*self.worker_state;
                 lock.lock().unwrap().status.clone()
             };
-            if status == WorkerStatus::Computing {
-                ui.spinner();
-                ui.label("Computing…");
-            }
         });
     }
 
@@ -395,13 +458,13 @@ impl RawViewerApp {
 
             ui.separator();
             ui.label("Jump to (s):");
-            let mut jump_str = format!("{:.3}", self.view_start_s);
-            let resp = ui.add(egui::TextEdit::singleline(&mut jump_str).desired_width(70.0));
-            if resp.lost_focus() {
-                if let Ok(t) = jump_str.parse::<f64>() {
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.jump_str).desired_width(70.0));
+            if resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if let Ok(t) = self.jump_str.trim().parse::<f64>() {
                     let max_t = self.meta.n_samples as f64 / self.meta.sample_rate - self.view_dur_s;
                     self.view_start_s = t.clamp(0.0, max_t.max(0.0));
                 }
+                self.jump_str = format!("{:.3}", self.view_start_s);
             }
 
             let display_rows_arc = {
@@ -467,6 +530,24 @@ impl RawViewerApp {
         });
     }
 
+    fn draw_status_bar(&self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            let status = {
+                let (lock, _) = &*self.worker_state;
+                lock.lock().unwrap().status.clone()
+            };
+            if status == WorkerStatus::Computing {
+                ui.spinner();
+                ui.label("Computing…");
+            }
+            
+            if self.is_compressed {
+                ui.separator();
+                ui.colored_label(egui::Color32::YELLOW, "Reading from compressed .cbin is slower");
+            }
+        });
+    }
+
     fn draw_nav_bar(&mut self, ui: &mut Ui) {
         let total_s = self.meta.n_samples as f64 / self.meta.sample_rate;
 
@@ -528,7 +609,48 @@ impl RawViewerApp {
             }
         }
 
+        let mut show_prefs = self.show_preferences;
+        if show_prefs {
+            egui::Window::new("Preferences")
+                .anchor(egui::Align2::RIGHT_TOP, [-10.0, 40.0])
+                .collapsible(false)
+                .open(&mut show_prefs)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Colormap:");
+                        let mut cm = self.colormap_choice.clone();
+                        egui::ComboBox::from_id_salt("cm_combo")
+                            .selected_text(match cm {
+                                ColorMapChoice::YellowMagenta => "Yellow-Magenta",
+                                ColorMapChoice::RedBlue => "Red-Blue",
+                                ColorMapChoice::OrangeBlue => "Orange-Blue",
+                                ColorMapChoice::IceFire => "Ice-Fire",
+                                ColorMapChoice::Vanimo => "Vanimo",
+                                ColorMapChoice::GreyScale => "Greyscale",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut cm, ColorMapChoice::YellowMagenta, "Yellow-Magenta");
+                                ui.selectable_value(&mut cm, ColorMapChoice::RedBlue, "Red-Blue");
+                                ui.selectable_value(&mut cm, ColorMapChoice::OrangeBlue, "Orange-Blue");
+                                ui.selectable_value(&mut cm, ColorMapChoice::IceFire, "Ice-Fire");
+                                ui.selectable_value(&mut cm, ColorMapChoice::Vanimo, "Vanimo");
+                                ui.selectable_value(&mut cm, ColorMapChoice::GreyScale, "Greyscale");
+                            });
+                        if cm != self.colormap_choice {
+                            self.colormap_choice = cm;
+                            self.heatmap_texture = None; // Force redraw
+                        }
+                    });
 
+                    ui.horizontal(|ui| {
+                        ui.label("Spike Threshold (µV):");
+                        if ui.add(egui::DragValue::new(&mut self.spike_threshold).speed(1.0).suffix(" µV")).changed() {
+                            self.heatmap_texture = None; // Redraw to update projection
+                        }
+                    });
+                });
+        }
+        self.show_preferences = show_prefs;
         // mouse-wheel scroll — 5% of window per tick
         let ticks = ctx.input(|i| {
             i.events.iter().filter_map(|e| match e {
@@ -562,6 +684,7 @@ impl RawViewerApp {
         TopBottomPanel::top("toolbar").show(ctx, |ui| { self.draw_toolbar(ui); });
         TopBottomPanel::top("preproc").show(ctx, |ui| { self.draw_preproc_panel(ui); });
         TopBottomPanel::top("chan_ctrl").show(ctx, |ui| { self.draw_channel_controls(ui); });
+        TopBottomPanel::bottom("status_bar").show(ctx, |ui| { self.draw_status_bar(ui); });
         TopBottomPanel::bottom("nav_bar").show(ctx, |ui| { self.draw_nav_bar(ui); });
 
         CentralPanel::default()
@@ -633,7 +756,7 @@ impl RawViewerApp {
                             
                             let sample_rate = self.meta.sample_rate;
                             let refractory_samples = (1.5 * sample_rate as f32 / 1000.0) as usize;
-                            let threshold = -30.0f32;
+                            let threshold = self.spike_threshold;
 
                             use rayon::prelude::*;
                             sums.par_iter_mut().enumerate().for_each(|(i, count)| {
@@ -660,7 +783,26 @@ impl RawViewerApp {
                                     }
                                 }
                             });
-                            self.projection_sums = sums;
+
+                            // Apply Gaussian convolution (sigma = 1.5, kernel size 7)
+                            let kernel = [0.0366, 0.111, 0.217, 0.271, 0.217, 0.111, 0.0366];
+                            let k_rad = 3;
+                            let mut smoothed = vec![0.0f32; sums.len()];
+                            for i in 0..sums.len() {
+                                let mut v = 0.0;
+                                let mut weight_sum = 0.0;
+                                for j in 0..=6 {
+                                    let idx = i as isize + (j as isize - k_rad);
+                                    if idx >= 0 && idx < sums.len() as isize {
+                                        v += sums[idx as usize] * kernel[j];
+                                        weight_sum += kernel[j];
+                                    }
+                                }
+                                if weight_sum > 0.0 {
+                                    smoothed[i] = v / weight_sum;
+                                }
+                            }
+                            self.projection_sums = smoothed;
 
                             build_heatmap_into(
                                 &mut self.pixel_buf,
@@ -848,11 +990,18 @@ impl RawViewerApp {
 
                         // Draw Projection Overlay
                         if !self.projection_sums.is_empty() {
-                            // User setting: Adjust this scaling factor to change how far to the right the spike counts project.
-                            let spike_scale_factor = 1.0; 
+                            // Adaptive scaling: inversely proportional to the window size. Base is calibrated to 0.5s.
+                            let spike_scale_factor = 1.0 * (0.5 / self.view_dur_s) as f32;
                             
-                            // 10% opacity white for all colormaps
-                            let color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10);
+                            // 10% opacity colors for each colormap
+                            let color = match self.colormap_choice {
+                                ColorMapChoice::YellowMagenta => egui::Color32::from_rgba_unmultiplied(250, 234, 130, 5),
+                                ColorMapChoice::RedBlue => egui::Color32::from_rgba_unmultiplied(204, 103, 230, 8),
+                                ColorMapChoice::OrangeBlue => egui::Color32::from_rgba_unmultiplied(242, 171, 126, 5),
+                                ColorMapChoice::IceFire => egui::Color32::from_rgba_unmultiplied(166, 217, 237, 8),
+                                ColorMapChoice::Vanimo => egui::Color32::from_rgba_unmultiplied(202, 237, 166, 5),
+                                ColorMapChoice::GreyScale => egui::Color32::from_rgba_unmultiplied(255, 255, 255, 2),
+                            };
 
                             let min_x = resp.rect.left();
                             let max_x = resp.rect.right(); // Can project across the entire image if scaled high enough
@@ -861,22 +1010,39 @@ impl RawViewerApp {
 
                             let row_h = h / n_rows as f32;
 
+                            let mut mesh = egui::epaint::Mesh::default();
+
                             for (i, &count) in self.projection_sums.iter().enumerate() {
-                                if count <= 0.0 { continue; }
                                 let x = min_x + count * spike_scale_factor;
                                 let x = x.min(max_x); // clamp to the right edge of the image
                                 
-                                let y_bottom = top_y + h - (i as f32) * row_h;
-                                let y_top = top_y + h - ((i + 1) as f32) * row_h;
+                                let y = top_y + h - (i as f32 + 0.5) * row_h;
 
-                                ui.painter().rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(min_x, y_top),
-                                        egui::pos2(x, y_bottom),
-                                    ),
-                                    0.0,
+                                let idx_base = mesh.vertices.len() as u32;
+                                mesh.vertices.push(egui::epaint::Vertex {
+                                    pos: egui::pos2(min_x, y),
+                                    uv: egui::epaint::WHITE_UV,
                                     color,
-                                );
+                                });
+                                mesh.vertices.push(egui::epaint::Vertex {
+                                    pos: egui::pos2(x, y),
+                                    uv: egui::epaint::WHITE_UV,
+                                    color,
+                                });
+
+                                if i > 0 {
+                                    mesh.indices.push(idx_base - 2);
+                                    mesh.indices.push(idx_base - 1);
+                                    mesh.indices.push(idx_base);
+
+                                    mesh.indices.push(idx_base - 1);
+                                    mesh.indices.push(idx_base + 1);
+                                    mesh.indices.push(idx_base);
+                                }
+                            }
+                            
+                            if !mesh.is_empty() {
+                                ui.painter().add(egui::Shape::mesh(mesh));
                             }
                         }
                     }

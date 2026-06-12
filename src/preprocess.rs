@@ -79,10 +79,15 @@ pub fn butter_highpass_sos(n: usize, wn: f64) -> Vec<Sos> {
 // Config
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpatialFilter { Off, GlobalCmr, LocalCmr, Destripe }
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum SpatialFilter {
+    Off,
+    GlobalCmr,
+    LocalCmr,
+    Destripe,
+}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PreprocConfig {
     pub dc_removal: bool,
     pub phase_shift: bool,
