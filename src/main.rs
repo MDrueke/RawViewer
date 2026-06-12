@@ -49,10 +49,58 @@ impl MainApp {
         };
         Self { state }
     }
+
+    fn custom_title_bar(&self, ctx: &egui::Context) {
+        let title_bar_height = 24.0;
+        let title_bar_color = egui::Color32::from_rgb(0x18, 0x18, 0x18);
+        
+        egui::TopBottomPanel::top("custom_title_bar")
+            .frame(egui::Frame::NONE.fill(title_bar_color))
+            .exact_height(title_bar_height)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Drag area
+                    let drag_rect = ui.available_rect_before_wrap();
+                    let response = ui.interact(drag_rect, ui.id().with("drag_title_bar"), egui::Sense::click_and_drag());
+                    if response.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if response.double_clicked() {
+                        let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                    }
+                    
+                    // Title text
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("RawViewer").color(egui::Color32::WHITE).size(14.0));
+                    });
+                    
+                    // Window controls
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+
+                        if ui.button(" 🗙 ").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        if ui.button(" 🗖 ").clicked() {
+                            let is_maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                        }
+                        if ui.button(" 🗕 ").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                    });
+                });
+            });
+    }
 }
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.custom_title_bar(ctx);
         let mut file_to_open = None;
 
         match &mut self.state {
@@ -125,7 +173,8 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("RawViewer")
             .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([800.0, 500.0])
+            .with_decorations(false),
         ..Default::default()
     };
 
