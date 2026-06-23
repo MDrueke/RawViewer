@@ -1030,8 +1030,9 @@ impl RawViewerApp {
 
                         // Draw Projection Overlay
                         if !self.projection_sums.is_empty() {
-                            // Adaptive scaling: inversely proportional to the window size. Base is calibrated to 0.5s.
-                            let spike_scale_factor = 1.0 * (0.5 / self.view_dur_s) as f32;
+                            // scale with window duration and threshold (baseline: -20 µV → 1x)
+                            let threshold_scale = self.spike_threshold.abs() / 20.0;
+                            let spike_scale_factor = threshold_scale * (0.5 / self.view_dur_s) as f32;
                             
                             // 10% opacity colors for each colormap
                             let color = match self.colormap_choice {

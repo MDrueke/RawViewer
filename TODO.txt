@@ -1,6 +1,5 @@
 
-5. Optimize FireIce colormap to darken out the mid colors a bit
+1. Optimize FireIce colormap to darken out the mid colors a bit
 
-9. Firing rate overlay should be scaled to threshold
-10. Sometimes when jumping to a distant chunk, the "computing..." spinner keeps spinning and the view is not updated. It hangs.
+2. Double clicking a channel opens a window to view the single channel waveform
 
