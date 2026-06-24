@@ -14,15 +14,7 @@ A lightweight viewer for raw Neuropixels electrophysiology data. Renders voltage
 
 ## Usage
 
-Launch with a file:
-```bash
-npxplorer --file /path/to/data.ap.bin
-```
-
-Or launch empty and use the file picker:
-```bash
-npxplorer
-```
+Just launch, and pick a file from the file dialog. 
 
 ### Navigation
 
